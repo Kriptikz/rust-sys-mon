@@ -1,0 +1,6 @@
+/target
+.DS_Store
+.env
+log/output.log
+log/sysmon.log
+rust-sys-mon
