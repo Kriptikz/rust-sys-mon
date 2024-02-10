@@ -6,20 +6,20 @@ use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Config, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use logwatcher::{LogWatcher, LogWatcherAction};
-use reqwest::{self};
 use reqwest::Client;
+use reqwest;
 use serde::Deserialize;
-use tokio::time::sleep;
 use std::error::Error;
 use std::path::Path;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use std::{
     env,
     time::{self, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{CpuExt, CpuRefreshKind, NetworkExt, RefreshKind, System, SystemExt};
 use tokio;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 #[derive(Debug, Deserialize, Clone)]
 struct LocalConfig {
@@ -31,30 +31,33 @@ struct LocalConfig {
 }
 
 impl LocalConfig {
-  fn from_env() -> Result<Self, env::VarError> {
-      Ok(Self {
-          influxdb_url: env::var("INFLUXDB_URL")?,
-          influxdb_token: env::var("INFLUXDB_TOKEN")?,
-          influxdb_org: env::var("INFLUXDB_ORG")?,
-          influxdb_bucket: env::var("INFLUXDB_BUCKET")?,
-          hostname: env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string()),
-      })
-  }
+    fn from_env() -> Result<Self, env::VarError> {
+        Ok(Self {
+            influxdb_url: env::var("INFLUXDB_URL")?,
+            influxdb_token: env::var("INFLUXDB_TOKEN")?,
+            influxdb_org: env::var("INFLUXDB_ORG")?,
+            influxdb_bucket: env::var("INFLUXDB_BUCKET")?,
+            hostname: env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string()),
+        })
+    }
 }
 
-async fn send_data_to_influxdb(client: &Client, config: &LocalConfig, data: String) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn send_data_to_influxdb(
+    client: &Client,
+    config: &LocalConfig,
+    data: String,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let response = client
+        .post(format!(
+            "{}/api/v2/write?org={}&bucket={}&precision=ns",
+            config.influxdb_url, config.influxdb_org, config.influxdb_bucket
+        ))
+        .header("Authorization", format!("Token {}", config.influxdb_token))
+        .body(data)
+        .send()
+        .await;
 
-  let response = client
-      .post(format!(
-          "{}/api/v2/write?org={}&bucket={}&precision=ns",
-          config.influxdb_url, config.influxdb_org, config.influxdb_bucket
-      ))
-      .header("Authorization", format!("Token {}", config.influxdb_token))
-      .body(data)
-      .send()
-      .await;
-
-      match response {
+    match response {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
@@ -66,7 +69,8 @@ async fn send_data_to_influxdb(client: &Client, config: &LocalConfig, data: Stri
                     .unwrap_or_else(|_| "Failed to get error body".to_string());
                 log::error!(
                     "Failed to send data to InfluxDB: Status {}. Error: {}",
-                    status, error_body
+                    status,
+                    error_body
                 );
             }
         }
@@ -75,66 +79,70 @@ async fn send_data_to_influxdb(client: &Client, config: &LocalConfig, data: Stri
         }
     }
 
-  Ok(())
+    Ok(())
 }
 
-async fn watch_log_file(path: String, client: Client, config: LocalConfig, batch_size: usize) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn watch_log_file(
+    path: String,
+    client: Client,
+    config: LocalConfig,
+    batch_size: usize,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (tx, mut rx) = mpsc::channel::<String>(100); // Adjust the buffer size as needed
 
-  let (tx, mut rx) = mpsc::channel::<String>(100); // Adjust the buffer size as needed
+    tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        while let Some(line) = rx.recv().await {
+            let filtered_line = line.replace(",", " - ");
+            let timestamp_ns = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let log_message = format!(
+                "log,host={},level={} message=\"{}\" {}",
+                config.hostname, "INFO", filtered_line, timestamp_ns
+            );
+            buffer.push(log_message);
+            if buffer.len() >= batch_size {
+                let data = buffer.join("\n");
+                send_data_to_influxdb(&client, &config, data).await?;
+                buffer.clear();
+            }
+        }
+        // Send remaining messages in the buffer
+        if !buffer.is_empty() {
+            let data = buffer.join("\n");
+            send_data_to_influxdb(&client, &config, data).await?;
+        }
 
-  tokio::spawn(async move {
-      let mut buffer = Vec::new();
-      while let Some(line) = rx.recv().await {
-          let timestamp_ns = SystemTime::now()
-              .duration_since(SystemTime::UNIX_EPOCH)
-              .unwrap()
-              .as_nanos();
-          let log_message = format!(
-              "log,host={},level={} message=\"{}\" {}",
-              config.hostname, "INFO", line, timestamp_ns
-          );
-          buffer.push(log_message);
-          if buffer.len() >= batch_size {
-              let data = buffer.join("\n");
-              send_data_to_influxdb(&client, &config, data).await?;
-              buffer.clear();
-          }
-      }
-      // Send remaining messages in the buffer
-      if !buffer.is_empty() {
-          let data = buffer.join("\n");
-          send_data_to_influxdb(&client, &config, data).await?;
-      }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    });
 
-      Ok::<(), Box<dyn Error + Send + Sync>>(())
-  });
+    // Set up the log watcher (synchronous context)
+    loop {
+        if Path::new(&path).exists() {
+            let mut log_watcher = LogWatcher::register(&path).unwrap();
+            log_watcher.watch(&mut move |line: String| {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    tx.send(line).await.unwrap();
+                });
+                LogWatcherAction::None
+            });
+            break;
+        } else {
+            log::error!("File does not exist, re-checking in 2 seconds");
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
 
-// Set up the log watcher (synchronous context)
-loop {
-  if Path::new(&path).exists() {
-      let mut log_watcher = LogWatcher::register(&path).unwrap();
-      log_watcher.watch(&mut move |line: String| {
-          let tx = tx.clone();
-          tokio::spawn(async move {
-              tx.send(line).await.unwrap();
-          });
-          LogWatcherAction::None
-      });
-      break;
-  } else {
-      log::error!("File does not exist, re-checking in 2 seconds");
-      sleep(Duration::from_secs(2)).await;
-  }
-}
-
-  Ok(())
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-
     dotenv().ok();
-    
+
     let local_config = LocalConfig::from_env().unwrap();
     let mut sys = System::new();
     let client = reqwest::Client::new();
@@ -148,7 +156,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     log4rs::init_config(log_config)?;
 
-    tokio::spawn(watch_log_file("/home/dagger/config.log".to_string(), client.clone(), local_config.clone(), 10));
+    tokio::spawn(watch_log_file(
+        "/home/dagger/config.log".to_string(),
+        client.clone(),
+        local_config.clone(),
+        10,
+    ));
 
     log::info!("rust-sys-mon started");
     let ten_secs = time::Duration::from_secs(10);
@@ -156,7 +169,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let rkind = RefreshKind::new()
         .with_cpu(CpuRefreshKind::everything().without_frequency())
         .with_memory()
-        .with_networks();
+        .with_networks()
+        .with_networks_list();
 
     loop {
         // First we update all information of our `System` struct.
@@ -251,7 +265,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
         let interface_data = format!(
             "network,host={},interface={} received={}i,transmitted={}i {}\n",
-            local_config.hostname, "total", total_data_received, total_data_transmitted, timestamp_ns
+            local_config.hostname,
+            "total",
+            total_data_received,
+            total_data_transmitted,
+            timestamp_ns
         );
         network_data.push_str(&interface_data);
 
@@ -260,7 +278,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut total_cpu_usage = 0.;
         for (i, cpu) in sys.cpus().iter().enumerate() {
             let cpu_usage_data = format!(
-                "cpu,host={},cpu={} usage={} {}\n",
+                "cpu,host={},cpu={}i usage={} {}\n",
                 local_config.hostname,
                 i,
                 cpu.cpu_usage(),
@@ -271,8 +289,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
 
         let cpu_usage_data = format!(
-            "cpu,host={},cpu={} usage={} {}\n",
-            local_config.hostname, "total", total_cpu_usage, timestamp_ns
+            "cpu,host={} total_usage={} {}\n",
+            local_config.hostname, total_cpu_usage, timestamp_ns
         );
         cpu_data.push_str(&cpu_usage_data);
 
@@ -281,7 +299,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "{}\n{}\n{}\n{}",
             memory_data, swap_data, network_data, cpu_data
         );
-
 
         send_data_to_influxdb(&client, &local_config, data).await?;
 
